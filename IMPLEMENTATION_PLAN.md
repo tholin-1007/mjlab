@@ -42,7 +42,7 @@
 | Al-Asqhar, Komura, Choi 2013, *Relationship Descriptors* | 用相对场景表面的描述子表示姿态，场景变形时动作跟着变 | 支持“场景被我们主动改了以后动作怎么跟”的方向，对应 §3.2 的 Level 2 |
 | Hodgins & Pollard 1997, *Adapting Simulated Behaviors for New Characters* | 几何缩放 L 时，按动力学相似缩放时间（√L）、力、力矩 | §3.4 的时间缩放初值，以及力矩可行性的先验估计 |
 | *Computational Climbing for Physics-Based Characters*（2014，McGill） | 把攀岩当运动规划：在岩点上搜索接触序列，再生成物理动作 | 与 Naderi 2017 同属“先规划接触、再求动作”一路，M5 高层规划器的参考 |
-| Naderi, Rajamäki, Hämäläinen 2017 (TOG), *Discovering and Synthesizing Humanoid Climbing Movements* | stance graph（四肢-岩点分配为节点）上做图搜索，底层用采样优化求过渡；手/脚与岩点用球铰约束连接 | (a) 接触序列的标准表示；(b) 抓握抽象（M3 的 attach 约束）；(c) M5 的高层规划器 |
+| Naderi, Rajamäki, Hämäläinen 2017 (TOG), *Discovering and Synthesizing Humanoid Climbing Movements* | stance graph（四肢-岩点分配为节点）上做图搜索，底层用采样优化求过渡；手/脚与岩点用球铰约束连接 | (a) 接触序列的标准表示；(b) 抓握抽象（对应 M3 的吸力脚手架）；(c) M5 的高层规划器 |
 | Naderi et al. 2018 (CGF) / 2019 (IEEE CoG) | 用 RL 学攀岩过渡；从已访问状态自监督初始化 episode | M3 的 reset 策略：参考状态初始化 + 自适应采样（本仓库 tracking 已有 adaptive sampling） |
 | Kang, Gu, Kwon 2024 (SCA), *Learning Climbing Controllers for Physics-Based Characters* | 两阶段：先学 hanging policy 得到“好的悬挂姿态 + 抓握状态”数据集，再学 climbing policy | 课程设计：先学静态挂姿（单帧 stance 保持），再学过渡。原文两阶段都用 AMP、用 depth 感知岩点；mjlab 目前没有 AMP，本计划以 tracking 为主，AMP 只在 M5 目标条件策略需要风格先验时再加 |
 | DeepMimic / AMP / PHC 系 | 参考状态初始化、early termination、跟踪奖励 | 本仓库 `tasks/tracking` 已实现（BeyondMimic 路线），直接复用 |
@@ -180,7 +180,7 @@ The Way Up 提供的是：单目视频、岩点 2D 框、每次岩点使用的�
 | 观测 | 现有 tracking 观测 + 四肢当前/下一个目标岩点在机器人坐标系下的位置 + 接触相位 | 新增 |
 | 奖励 | 现有跟踪项 + 末端相对目标岩点的位姿误差 + 接触匹配（`ContactSensor` 对比参考接触表）+ 非接触肢体碰墙惩罚 | `sensor/contact_sensor.py` 可用 |
 | 终止 | 现有 anchor/EE 偏差终止 + “应接触的肢体全部脱离”（坠落） | 小改 |
-| 课程 | 慢放系数 `k`、墙面倾角 `α`、约束辅助强度（阶段 A→B）、单 stance 保持 → 单步过渡 → 整条路线 | `envs/mdp/curriculums.py` |
+| 课程 | 慢放系数 `k`、墙面倾角 `α`、吸力上限（阶段 A→B）、单 stance 保持 → 单步过渡 → 整条路线 | `envs/mdp/curriculums.py` |
 
 ---
 
@@ -204,7 +204,7 @@ The Way Up 提供的是：单目视频、岩点 2D 框、每次岩点使用的�
 - 判据：Level 1 下 IK 可行帧 > 95%，且至少若干片段在某个 `α` 下力矩可行率 > 90%。**如果在垂直墙上所有片段都不可行，这里就要决定：只做 slab，或换仿真里的假想末端/更强的机器人模型。**
 
 **M3 — 单片段跟踪训练（约 3 周）**
-- §5 的任务包；阶段 A（约束辅助）先跑通一条完整路线。
+- §5 的任务包；阶段 A（带吸力）先跑通一条完整路线。
 - 判据：单片段成功率（爬到顶不坠落）> 90%；接触时序与参考一致。
 
 **M4 — The Way Up、增广与去吸力（约 3 周）**
