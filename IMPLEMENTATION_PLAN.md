@@ -2,10 +2,25 @@
 
 目标：以本仓库（mjlab，与 `lu-yidan/mjlab` 的 `main` 完全一致，commit `f389738`）为训练框架，用 **CIMI4D**（带场景的人体攀岩动捕）和 **图片岩点检测数据集** 重建攀岩场景，并把人体攀岩动作 retarget 到 Unitree G1，最终在仿真中训练出可跟踪的攀岩策略。核心难点不只是 motion retarget，而是 **场景的 scale**：人和机器人的体型、臂展、末端执行器、力量体重比都不同，岩点布局必须跟着变。
 
-> **本计划写作时的信息缺口（需要你补充）**
-> - 飞书文档 `my.feishu.cn/docx/Eu2XdLKjOouA9xxncfHcPe9Fnjg` 在当前云端会话的网络策略下无法访问，本计划 **没有读到其内容**。请把正文贴过来，或在环境网络设置里放行 `my.feishu.cn`，我再据此修订。
-> - CIMI4D 官网（`lidarhumanmotion.net`）与 arXiv 同样被拦截，下文关于 CIMI4D 文件格式的描述来自论文摘要级信息和记忆，标注了“待核实”的条目必须在拿到数据后第一时间确认。
-> - “图片检测攀岩点”具体是哪一个数据集未指明，下文按 Roboflow Universe 上的 hold detection / segmentation 类数据集来设计，换成别的数据集只影响 M4 的检测器训练部分。
+> **信息来源说明**
+> - 本版已按《攀岩调研》文档的正文修订（文档里的嵌入视频/附件看不到，包括那篇 master thesis）。
+> - CIMI4D 官网（`lidarhumanmotion.net`）与 arXiv 在当前云端会话里被网络策略拦截，下文关于 CIMI4D / ClimbingCap 文件格式的描述来自论文摘要级信息，标注“待核实”的条目必须在拿到数据后第一时间确认。
+> - 图片数据集确认为 **The Way Up**（Maschek & Schedl，CVPR 2025 CVsports workshop，arXiv 2505.12854）。它不只是岩点检测：22 段视频、10 名攀岩者、2 条路线、940 次岩点使用，标注了岩点位置、**使用顺序、使用时刻、哪只手/脚**。也就是说它直接给出 2D 的 contact graph，用法见 §4.3。
+
+---
+
+## 0. 与已有尝试的对应
+
+调研文档里记录的四个卡点，以及本计划对应的解法：
+
+| 已有尝试与卡点 | 原因判断 | 本计划的对应 |
+|---|---|---|
+| 手工搭场景，很难设计出符合 humanoid 几何的场景 | 岩点布局和机器人可达域是耦合的，手工调等于人肉解 §3.2 的优化 | 场景从数据来，布局缩放由优化器决定（§3.2）；手工只需要定岩点库 |
+| RL 让四肢 follow 目标点，学不会真实攀爬，多接触易陷局部最优 | 没有参考动作，接触序列的探索空间太大 | 用 retarget 后的参考动作做 tracking（参考状态初始化 + 接触时序奖励）；无参考的目标条件策略放到最后，用 WoCoCo 式分阶段接触奖励 + tracking expert 蒸馏 |
+| 手脚加模拟吸力 | 合理的脚手架，问题是不能留到部署 | 保留为训练阶段 A，并把吸力上限做成课程变量逐步退火到 0（§5），同时换成能真实挂住岩点的末端几何 |
+| 从 RGB 视频 real2sim，mesh 粗糙 | 攀岩墙不需要 mesh | 把场景参数化为“平面片 + 岩点（位置/朝向/类型）”，只重建这些参数（§4）；The Way Up 的接触标注还能反过来约束单目人体重建 |
+
+小倾角斜坡 testbed 与本计划“先 slab、倾角作课程变量”的路线一致，可直接作为 M3 的第一个环境。
 
 ---
 
@@ -26,9 +41,10 @@
 | Ho, Komura, Tai 2010, *Spatial Relationship Preserving Character Motion Adaptation* | interaction mesh：对身体关节点 + 环境采样点做 Delaunay 四面体化，最小化 Laplacian 坐标形变 | M2 的主目标函数；岩点中心/墙面采样点直接作为网格顶点 |
 | Al-Asqhar, Komura, Choi 2013, *Relationship Descriptors* | 用相对场景表面的描述子表示姿态，场景变形时动作跟着变 | 支持“场景被我们主动改了以后动作怎么跟”的方向，对应 §3.2 的 Level 2 |
 | Hodgins & Pollard 1997, *Adapting Simulated Behaviors for New Characters* | 几何缩放 L 时，按动力学相似缩放时间（√L）、力、力矩 | §3.4 的时间缩放初值，以及力矩可行性的先验估计 |
+| *Computational Climbing for Physics-Based Characters*（2014，McGill） | 把攀岩当运动规划：在岩点上搜索接触序列，再生成物理动作 | 与 Naderi 2017 同属“先规划接触、再求动作”一路，M5 高层规划器的参考 |
 | Naderi, Rajamäki, Hämäläinen 2017 (TOG), *Discovering and Synthesizing Humanoid Climbing Movements* | stance graph（四肢-岩点分配为节点）上做图搜索，底层用采样优化求过渡；手/脚与岩点用球铰约束连接 | (a) 接触序列的标准表示；(b) 抓握抽象（M3 的 attach 约束）；(c) M5 的高层规划器 |
 | Naderi et al. 2018 (CGF) / 2019 (IEEE CoG) | 用 RL 学攀岩过渡；从已访问状态自监督初始化 episode | M3 的 reset 策略：参考状态初始化 + 自适应采样（本仓库 tracking 已有 adaptive sampling） |
-| Kang, Gu, Kwon 2024 (SCA), *Learning Climbing Controllers for Physics-Based Characters* | 两阶段：先学 hanging policy 得到“好的悬挂姿态 + 抓握状态”数据集，再学 climbing policy | 课程设计：先学静态挂姿（单帧 stance 保持），再学过渡 |
+| Kang, Gu, Kwon 2024 (SCA), *Learning Climbing Controllers for Physics-Based Characters* | 两阶段：先学 hanging policy 得到“好的悬挂姿态 + 抓握状态”数据集，再学 climbing policy | 课程设计：先学静态挂姿（单帧 stance 保持），再学过渡。原文两阶段都用 AMP、用 depth 感知岩点；mjlab 目前没有 AMP，本计划以 tracking 为主，AMP 只在 M5 目标条件策略需要风格先验时再加 |
 | DeepMimic / AMP / PHC 系 | 参考状态初始化、early termination、跟踪奖励 | 本仓库 `tasks/tracking` 已实现（BeyondMimic 路线），直接复用 |
 | InterMimic / PhysHOI / HDMI 一类 HOI 模仿 | 奖励里加“身体-物体相对位姿”和“接触图”项，比纯关节跟踪更稳 | M3 的 hold-relative EE 奖励与 contact-match 奖励 |
 | PARC (Xu et al. 2025) | 运动生成器与物理 tracker 迭代：tracker 修正后的动作回灌扩充数据 | M4 的增广闭环：在缩放/扰动后的墙上跟踪成功的 rollout 作为新参考 |
@@ -36,7 +52,15 @@
 | VideoMimic (2025) | 从视频联合重建人和场景，并把人与场景一起缩放到机器人尺寸 | 均匀缩放 baseline（§3.2 Level 0）的出处与对照 |
 | GMR (2025) | 按身体部位非均匀缩放的运动学 retarget | 无场景的 baseline，用来量化“不处理场景 scale 会差多少” |
 
-另有两条机器人侧的近邻工作需要在能联网后精读：ETH 的 G1 爬梯子统一策略（先从少量人体数据学接触规划，再在程序化环境里 RL 泛化），以及 2026 年 11 月 arXiv 上的 *Grasp-Taxonomy Conditioning as a Mode Switch for Dexterous Grasping of Climbing Holds*（仅见标题，未核实内容）。同一课题组的 **ClimbingCap / AscendMotion**（CVPR 2025，22 名教练、12 面墙、412k 帧）是 CIMI4D 的放大版，格式若兼容应作为第二数据源。
+Humanoid 侧的三个近邻工作（调研文档已列）及其在本计划中的位置：
+
+| 工作 | 要点 | 借鉴 |
+|---|---|---|
+| **LadderMan**（Amazon FAR 等，arXiv 2606.05873，G1 爬梯子） | 两阶段：先用 hybrid motion tracking 从单条参考动作学出多个 expert，再蒸馏成统一的 depth-based 策略（输入本体感知 + 深度 + 上/下指令）；用立体深度基础模型缩小深度的 sim-to-real gap | 整体路线的直接模板：M3 = tracking expert，M5 = 蒸馏成感知策略。区别是梯子的几何是规则的，攀岩墙需要 §3.2 的场景缩放来造多样化的 expert |
+| **WoCoCo**（arXiv 2406.06005） | 把任务分解成接触阶段，用稠密的接触奖励 + 阶段计数解决 sequential contact 的探索，不需要参考动作 | M3 的 contact-match 奖励按“接触阶段”组织；M5 无参考动作时的奖励设计 |
+| **ETH sparse 3D traversal**（攀爬架） | 稀疏 3D 支撑结构上的全身穿越（未能联网精读，细节待核实） | 感知表示与稀疏落点选择，M5 参考 |
+
+数据侧：**ClimbingCap / AscendMotion**（CVPR 2025，22 名教练、12 面墙、412k 帧 RGB + LiDAR + IMU，带岩点标注）是 CIMI4D 同课题组的放大版，拿到后与 CIMI4D 共用同一条转换管线（§4.2）。另外 2026 年 11 月 arXiv 上有一篇 *Grasp-Taxonomy Conditioning as a Mode Switch for Dexterous Grasping of Climbing Holds*（仅见标题，未核实内容），与末端设计相关。
 
 ---
 
@@ -129,14 +153,17 @@ Retarget 后输出 `RobotClimbClip`：本仓库 tracking 任务现有的 npz 字
 3. 接触清洗：IMU 姿态有漂移，手脚位置误差在厘米级。用“末端低速 + 距岩点近”重新判定接触并与标注交叉校验，然后把接触期间的末端 **snap** 到岩点上（先修人体数据再 retarget，否则误差会被放大）。
 4. 人工抽查工具：一个 viser 脚本同屏显示 SMPL、墙面点云、岩点、接触标记（本仓库 viewer 已基于 viser）。
 
-### 4.3 图片 → ClimbClip（只有场景，没有动作）
+### 4.3 The Way Up → ClimbClip
 
-1. 用图片数据集训练岩点实例分割 + 类型分类（YOLO-seg 之类即可，这不是研究点）。
-2. 检测 → 单应校正 → §3.1 定标 → 2D 岩点布局。
-3. 用途有两个：
-   - **场景增广**：给已有动作找“布局相似”的新墙面（在 stance 可达性意义下匹配），或作为 M5 目标条件策略的训练/测试场景分布。
-   - **补全 CIMI4D**：把检测器跑在 CIMI4D 的 RGB 上，给扫描岩点补类型标签。
-4. 图片场景本身没有动作。动作来源是：把 CIMI4D 的接触序列通过 §3.2 Level 2 形变到新布局；或 M5 的规划器生成。
+The Way Up 提供的是：单目视频、岩点 2D 框、每次岩点使用的肢体/顺序/时刻。没有 3D 动作、没有度量尺度、只有 2 条路线。按价值从高到低有三种用法：
+
+1. **Contact graph 来源（最有价值）。** 10 名攀岩者爬同样 2 条路线，等于同一面墙上的多种 beta（接触序列）。这正好是 §3.2 最需要的数据：对同一布局，不同身材的人选了不同的接触序列，可以用来检验“缩放后的布局上，哪一种 beta 对 G1 可行”。
+2. **接触锚定的单目重建。** 岩点在墙平面上的位置已知、接触时刻已知，就可以把视频 HMR（GVHMR 一类）的结果用“接触期间末端落在对应岩点上”作为约束来优化全局轨迹。这绕开了调研里“RGB 重建 mesh 粗糙”的问题：场景只是平面 + 岩点，人体全局位置由接触钉住。产出的 3D 动作精度不如 CIMI4D，但走通后任意攀岩视频都能进管线，这是 real2sim 路线的最小可行版本。
+3. **岩点检测器训练 + 评测基准。** 训练岩点检测（YOLO 类即可，不是研究点），跑在 CIMI4D / AscendMotion 的 RGB 上补类型标签；The Way Up 的使用标注同时可作为我们自动接触提取（§4.2 第 3 步）的评测集。
+
+流程：检测/读取岩点框 → 单应校正到墙面正视图 → §3.1 定标 → 2D 布局 + 接触表 →（可选）用法 2 得到 3D 动作。
+
+数据量很小（2 条路线），所以它不是场景多样性的来源。新布局的来源是：对 CIMI4D / AscendMotion 的布局做 §3.2 Level 2 形变增广，以及后续用检测器处理更多岩馆照片。
 
 ---
 
@@ -147,8 +174,8 @@ Retarget 后输出 `RobotClimbClip`：本仓库 tracking 任务现有的 npz 字
 | 模块 | 内容 | 仓库现状 |
 |---|---|---|
 | 场景生成 | 由 `scene.json` 用 `MjSpec` 生成墙面 + 岩点实体。每个 env 的布局不同：岩点位置通过 `dr.geom_pos` / `dr.body_pos` 做 per-world 展开，或把岩点做成 mocap body 用 `write_mocap_pose_to_sim` 逐 env 设置 | 两种机制仓库里都有（`envs/mdp/dr/geom.py`、`entity.py`），需要实测哪种在 mjwarp 下碰撞更稳。岩点 **数量** 每个 env 必须相同，按最大数量预分配、多余的挪到远处 |
-| 抓握抽象 | 阶段 A：手与岩点在接触区间内用 equality（connect/weld）约束连接，按参考接触表开关。阶段 B：换成钩状末端 + 真实接触摩擦，去掉约束 | 仓库 Python 层目前没有 equality 开关的封装，**需要先验证 mujoco-warp 3.16 对 per-world `eq_active` 的支持**；不支持则阶段 A 改用 adhesion actuator 或直接跳到阶段 B |
-| 末端执行器 | G1 的变体：把橡胶手换成钩爪几何（纯 MJCF 改动）；脚保持原样 | `asset_zoo/robots/unitree_g1` 已有，新增一个 variant |
+| 抓握抽象 | 阶段 A：沿用已有的“手脚模拟吸力”，但只在参考接触表指定的（肢体, 岩点）对上生效，并给吸力设上限。阶段 B：吸力上限按课程退火到 0，靠钩状手掌 + 真实接触摩擦挂住岩点 | 仓库里没有现成的 adhesion / equality 开关封装，把已有吸力实现迁进来即可。若想用 equality（connect）替代，**需先验证 mujoco-warp 3.16 对 per-world `eq_active` 的支持** |
+| 末端执行器 | G1 的变体：橡胶手换成参数化的钩状手掌几何（纯 MJCF 改动），钩口宽度/深度/角度作为参数，仿真里扫参得到的结果直接指导 3D 打印件设计；脚保持原样 | `asset_zoo/robots/unitree_g1` 已有，新增一个 variant |
 | Command | `ClimbMotionCommand` 继承 `MotionCommand`：多 clip 加载、每个 env 绑定各自的场景参数、暴露接触表和未来 k 个目标岩点 | 现有 `MotionLoader` 只支持单文件，需要扩展 |
 | 观测 | 现有 tracking 观测 + 四肢当前/下一个目标岩点在机器人坐标系下的位置 + 接触相位 | 新增 |
 | 奖励 | 现有跟踪项 + 末端相对目标岩点的位姿误差 + 接触匹配（`ContactSensor` 对比参考接触表）+ 非接触肢体碰墙惩罚 | `sensor/contact_sensor.py` 可用 |
@@ -162,9 +189,9 @@ Retarget 后输出 `RobotClimbClip`：本仓库 tracking 任务现有的 npz 字
 每个里程碑都有一个明确的 go/no-go 判据，避免在走不通的方向上堆工程。
 
 **M0 — 数据与前提确认（约 1 周）**
-- 申请并下载 CIMI4D（通常需签协议），核实文件格式、是否有 SMPL 手部、接触与岩点标注的粒度。
-- 读飞书文档，对齐目标。
-- 验证 mujoco-warp 的 equality 开关与 per-world 岩点位置。
+- 核实 CIMI4D（及已拿到的话，AscendMotion）的文件格式、是否有 SMPL 手部、接触与岩点标注的粒度；下载 The Way Up。
+- 把已有的吸力实现和小倾角斜坡 testbed 迁到本仓库。
+- 验证 per-world 岩点位置（`dr.geom_pos` 或 mocap）在 mjwarp 下的碰撞表现。
 - 判据：能在 viser 里同屏看到一段 CIMI4D 的人、墙、岩点、接触。
 
 **M1 — CIMI4D → ClimbClip（约 2 周）**
@@ -180,14 +207,16 @@ Retarget 后输出 `RobotClimbClip`：本仓库 tracking 任务现有的 npz 字
 - §5 的任务包；阶段 A（约束辅助）先跑通一条完整路线。
 - 判据：单片段成功率（爬到顶不坠落）> 90%；接触时序与参考一致。
 
-**M4 — 图片场景与增广（约 3 周）**
-- 岩点检测器；图片 → 布局；Level 2 形变把动作迁移到新布局；PARC 式回灌。
-- 去掉 attach 约束（阶段 B）。
-- 判据：多片段、多布局的单一策略；无约束辅助下仍能完成 slab 路线。
+**M4 — The Way Up、增广与去吸力（约 3 周）**
+- The Way Up → 布局 + contact graph；接触锚定的单目重建（§4.3 用法 2）；岩点检测器。
+- Level 2 形变把动作迁移到新布局；PARC 式回灌，得到一批不同布局/倾角上的 tracking expert。
+- 吸力退火到 0（阶段 B），同时扫钩状手掌参数。
+- 判据：无吸力下仍能完成 slab 路线；至少一段 The Way Up 视频走通“视频 → 场景 + 动作 → G1 tracking”全流程。
 
-**M5 — 泛化与规划（开放）**
-- 目标条件策略：输入未来岩点序列而非参考动作；高层用 Naderi 式 stance graph 搜索在新墙上给出接触序列。
-- sim-to-real 评估：域随机化（摩擦、岩点位置误差、电机力矩上限）、真实末端设计。
+**M5 — 蒸馏成感知策略与部署（开放）**
+- 按 LadderMan 的路线，把 M4 的多个 expert 蒸馏成单一策略：输入本体感知 + 深度（或由岩点检测 + 深度得到的未来 k 个岩点位置），不再输入参考动作。仓库已有 `raycast_sensor` / `camera_sensor` 可提供深度观测。
+- 新墙上的接触序列由高层给出：Naderi 式 stance graph 搜索，或直接用人的 beta（The Way Up 式标注）经 §3.2 缩放。
+- 部署侧：手掌打印件按仿真扫参结果出图；视觉用岩点检测 + 深度定位岩点，必要时预先扫图建墙面模型；域随机化（摩擦、岩点位置误差、电机力矩上限）；脚部触觉作为接触确认信号的可选项。
 
 ---
 
@@ -196,19 +225,21 @@ Retarget 后输出 `RobotClimbClip`：本仓库 tracking 任务现有的 npz 字
 | 风险 | 影响 | 对策 |
 |---|---|---|
 | G1 力量体重比不足 | 垂直/仰角路线不可行 | 倾角作为变量，M2 就量化；先做 slab |
-| G1 无手指 | 无法真实抓握 | 钩状末端 + jug 岩点库；约束辅助只作训练脚手架，M4 必须去掉 |
+| G1 无手指 | 无法真实抓握 | 钩状手掌打印件 + jug 岩点库；吸力只作训练脚手架，M4 必须退火到 0 |
 | CIMI4D 手部/接触精度不够 | retarget 的硬约束建在错误接触上 | M1 的 snap 与人工抽查；必要时只用高置信片段 |
 | CIMI4D 可用片段太少（论文规模约 12 名攀岩者、13 面墙、约 18 万帧，待核实） | 数据不足以训通用策略 | 引入 AscendMotion；依赖 §3.2 的场景形变做增广 |
 | mujoco-warp 对 equality 开关 / 大量岩点碰撞的支持或性能 | 阶段 A 走不通或训练慢 | M0 先验证；岩点用凸基元而非网格；只对目标岩点附近启用碰撞 |
-| 图片无度量尺度与倾角 | 重建场景不准 | 图片只贡献布局分布，度量由 §3.2 重新决定 |
+| The Way Up 无度量尺度与倾角、只有 2 条路线 | 重建场景不准、多样性不足 | 它只贡献布局和 contact graph，度量由 §3.2 重新决定；多样性靠布局形变增广 |
 | 数据许可 | CIMI4D 及各图片数据集的再分发限制 | 数据不入库，仓库只放转换脚本 |
 
 ---
 
 ## 8. 需要你确认的问题
 
-1. 飞书文档的内容（见顶部）。
-2. “图片检测攀岩点”具体指哪个数据集？是否有同一面墙的多视角或带人的图片？
-3. 目标是 **仅仿真**（可以用假想末端、放宽力矩）还是 **要上真机 G1**？这直接决定 M2 的可行性判据有多严。
-4. 是否接受改 G1 末端（钩爪）？还是必须用原装橡胶手或 Dex3 灵巧手？
+调研文档已经回答了目标（要上真机，手掌用打印件、可改装手臂）和图片数据集（The Way Up）。本计划据此把 M2 的力矩可行性判据按真机限位来定。还剩：
+
+1. ClimbingCap / AscendMotion 的下载链接拿到了吗？拿到的话 M1 直接两个数据集一起做。
+2. 手掌打印件“挂住岩点，避免承重”的意思我理解为：手只负责挂住和保持平衡，体重主要由腿承担。如果是这样，M2 的可行性筛选会加一条“手部接触力上限”约束，并且只选腿主导的片段。请确认。
+3. “可改装手臂（承重发力）”的改装范围：只换末端，还是会换更大力矩的肘/肩电机？这决定能爬的最大倾角。
+4. 已有的吸力实现和斜坡 testbed 是基于哪个框架写的（mjlab / IsaacLab / 其他）？决定 M0 迁移的工作量。
 5. 代码放在本仓库的 `tasks/climbing/`，还是作为依赖 mjlab 的独立仓库？上游 mjlab 更新频繁，独立仓库更容易跟进。
